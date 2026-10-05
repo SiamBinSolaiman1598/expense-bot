@@ -2,3 +2,4 @@
 expenses.db
 __pycache__/
 *.zip
+bot.log

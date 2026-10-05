@@ -15,7 +15,7 @@ if len(sys.argv) != 2:
 if not core.TOKEN or not WEBHOOK_SECRET:
     sys.exit("Set TELEGRAM_BOT_TOKEN and WEBHOOK_SECRET in .env first.")
 
-url = f"https://{sys.argv[1]}.pythonanywhere.com/webhook"
+url = f"https://{sys.argv[1].lower()}.pythonanywhere.com/webhook"
 data = urllib.parse.urlencode({
     "url": url,
     "secret_token": WEBHOOK_SECRET,
