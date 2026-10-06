@@ -25,8 +25,8 @@ COMMANDS = (
     "<b>Add</b>\n"
     "<code>tea - 20</code> – add an expense (send one or many lines at once)\n\n"
     "<b>See</b>\n"
-    "/today – today's items and total\n"
-    "/month – this month's items and total\n"
+    "/month – this month's items and total (shown after every change)\n"
+    "/day – today's items and total\n"
     "/total – every item and total till today\n\n"
     "<b>Edit</b>\n"
     "/edit 3 – change row #3 of the table you last looked at (then send e.g. <code>home - 100</code>)\n"
@@ -127,7 +127,7 @@ def set_last_view(user_id, view):
 def get_last_view(user_id):
     with db() as conn:
         row = conn.execute("SELECT view FROM last_view WHERE user_id = ?", (user_id,)).fetchone()
-    return row[0] if row else "today"
+    return row[0] if row else "month"
 
 
 def set_pending_edit(user_id, expense_id):
@@ -220,7 +220,7 @@ def undo(user_id):
         if not row:
             return ["Nothing to undo."]
         conn.execute("DELETE FROM expenses WHERE id = ?", (row[0],))
-    return show(user_id, "today", f"Removed: {escape(row[1])} - {fmt_amount(row[2])}")
+    return show(user_id, "month", f"Removed: {escape(row[1])} - {fmt_amount(row[2])}")
 
 
 def delete_rows(user_id, args):
@@ -231,7 +231,7 @@ def delete_rows(user_id, args):
     if not nums or len(nums) != len(args) or not all(1 <= x <= len(rows) for x in nums):
         return [f"Send row numbers from {label} table (it has {len(rows)} rows), "
                 "e.g. <code>/del 2</code> or <code>/del 2 5</code>.\n"
-                "To delete from another table, open it first with /today, /month or /total."]
+                "To delete from another table, open it first with /day, /month or /total."]
     picked = [rows[x - 1] for x in nums]
     with db() as conn:
         conn.executemany("DELETE FROM expenses WHERE id = ?", [(r[0],) for r in picked])
@@ -334,7 +334,7 @@ def add_lines(user_id, text):
     if bad:
         msg.append("⚠️ Couldn't read: " + ", ".join(f"<code>{escape(b)}</code>" for b in bad)
                    + "\nUse the format <code>name - amount</code>")
-    return show(user_id, "today", "\n\n".join(msg))
+    return show(user_id, "month", "\n\n".join(msg))
 
 
 def handle(user_id, text):
@@ -354,7 +354,7 @@ def handle(user_id, text):
         return ["Edit cancelled." if editing else "Nothing to cancel."]
     if cmd == "/edit":
         return start_edit(user_id, text)
-    if cmd == "/today":
+    if cmd in ("/day", "/today"):
         return show(user_id, "today")
     if cmd == "/month":
         return show(user_id, "month")
