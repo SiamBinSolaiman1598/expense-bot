@@ -31,7 +31,9 @@ COMMANDS = (
     "<b>Edit</b>\n"
     "/edit 3 – change row #3 of the table you last looked at (then send e.g. <code>home - 100</code>)\n"
     "/edit 3 home - 100 – same, in one message\n"
-    "/edit 3 100 – change only the amount\n\n"
+    "/edit 3 100 – change only the amount\n"
+    "/edit 3 Home to office – change only the name\n"
+    "(several /edit lines in one message change several rows)\n\n"
     "<b>Delete</b>\n"
     "/undo – delete the last entry\n"
     "/del 3 – delete row #3 of the table you last looked at\n"
@@ -237,43 +239,64 @@ def delete_rows(user_id, args):
     return show(user_id, view, f"🗑 Removed:\n{removed}")
 
 
+EDIT_RE = re.compile(r"\s*/edit(?:@\S+)?\s+(\d+)\s*(.*?)\s*$", re.I)
+
+
 def start_edit(user_id, text):
-    """/edit 3 home - 100 changes row #3 now; /edit 3 alone asks for the new value."""
+    """Each line "/edit 3 home - 100" changes row #3 of the last table; "/edit 3" alone asks for the value."""
     view = get_last_view(user_id)
     rows = view_rows(user_id, view)
-    m = re.match(r"\s*/\S+\s+(\d+)\s*(.*)$", text, re.S)
-    if not m or not 1 <= int(m.group(1)) <= len(rows):
-        return [f"Send a row number from {VIEWS[view]['label']} table (it has {len(rows)} rows), "
-                "e.g. <code>/edit 2</code> or <code>/edit 2 tea - 40</code>.\n"
-                "To edit another day, open its table first with /month or /total."]
-    num, new = int(m.group(1)), m.group(2).strip()
-    expense_id, name, amount, spent_on = rows[num - 1]
-    if new:
-        return apply_edit(user_id, expense_id, new)
-    set_pending_edit(user_id, expense_id)
-    return [f"✏️ Editing #{num}: {escape(name)} - {fmt_amount(amount)} ({spent_on})\n\n"
-            "Send the new value, e.g. <code>tea - 40</code>\n"
-            "or just a number to change only the amount.\n/cancel to keep it as it is."]
+    lines = [l for l in text.splitlines() if l.strip()]
+    usage = (f"Send a row number from {VIEWS[view]['label']} table (it has {len(rows)} rows), "
+             "e.g. <code>/edit 2</code> or <code>/edit 2 tea - 40</code>.\n"
+             "To edit another day, open its table first with /month or /total.")
+
+    if len(lines) == 1:
+        m = EDIT_RE.match(lines[0])
+        if not m or not 1 <= int(m.group(1)) <= len(rows):
+            return [usage]
+        num, new = int(m.group(1)), m.group(2)
+        if not new:
+            expense_id, name, amount, spent_on = rows[num - 1]
+            set_pending_edit(user_id, expense_id)
+            return [f"✏️ Editing #{num}: {escape(name)} - {fmt_amount(amount)} ({spent_on})\n\n"
+                    "Send the new value, e.g. <code>tea - 40</code>\n"
+                    "or just a name or just a number to change only that.\n/cancel to keep it as it is."]
+
+    # Row numbers refer to the table as it was before this message, so they don't shift between lines
+    notes, edited = [], 0
+    for line in lines:
+        m = EDIT_RE.match(line)
+        if not m or not m.group(2) or not 1 <= int(m.group(1)) <= len(rows):
+            notes.append(f"⚠️ Skipped <code>{escape(line.strip())}</code>")
+            continue
+        notes.append(f"#{m.group(1)} " + update_expense(user_id, rows[int(m.group(1)) - 1][0], m.group(2)))
+        edited += 1
+    if not edited:
+        return ["\n".join(notes) + "\n\n" + usage]
+    return show(user_id, view, "✏️ Edited:\n" + "\n".join(notes))
 
 
 def apply_edit(user_id, expense_id, text):
+    return show(user_id, get_last_view(user_id), "✏️ Edited: " + update_expense(user_id, expense_id, text))
+
+
+def update_expense(user_id, expense_id, text):
+    """Change one entry. Text can be "name - amount", just an amount, or just a name. Returns "old → new"."""
     with db() as conn:
         old = conn.execute("SELECT name, amount FROM expenses WHERE id = ? AND user_id = ?",
                            (expense_id, user_id)).fetchone()
         if not old:
-            return ["That entry no longer exists."]
+            return "that entry no longer exists"
         text = text.strip()
         if re.fullmatch(r"\d+(?:\.\d+)?", text):
             name, amount = old[0], float(text)
         elif m := LINE_RE.match(text):
             name, amount = m.group(1).strip(), float(m.group(2))
         else:
-            set_pending_edit(user_id, expense_id)  # keep waiting for a valid value
-            return [f"⚠️ Couldn't read <code>{escape(text)}</code>. Send it like <code>tea - 40</code>, "
-                    "or /cancel."]
+            name, amount = text, old[1]
         conn.execute("UPDATE expenses SET name = ?, amount = ? WHERE id = ?", (name, amount, expense_id))
-    return show(user_id, get_last_view(user_id),
-                f"✏️ Edited: {escape(old[0])} - {fmt_amount(old[1])} → {escape(name)} - {fmt_amount(amount)}")
+    return f"{escape(old[0])} - {fmt_amount(old[1])} → {escape(name)} - {fmt_amount(amount)}"
 
 
 def clear(user_id, args):
