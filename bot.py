@@ -7,8 +7,8 @@ import core
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    reply = core.handle(update.effective_user.id, update.message.text)
-    await update.message.reply_text(reply, parse_mode=ParseMode.HTML)
+    for reply in core.handle(update.effective_user.id, update.message.text):
+        await update.message.reply_text(reply, parse_mode=ParseMode.HTML)
 
 
 def main():

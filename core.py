@@ -23,12 +23,22 @@ LINE_RE = re.compile(r"^\s*(.+?)\s*(?:[-:=]\s*|\s)(\d+(?:\.\d+)?)\s*$")
 HELP = (
     "Send expenses as:\n<code>tea - 20</code>\n<code>bus fare - 45</code>\n"
     "(one or many lines per message)\n\n"
-    "Commands:\n/today – today's summary\n/month – this month's summary\n"
-    "/total – all-time summary by month\n"
+    "Commands:\n/today – today's items\n/month – this month's items and total\n"
+    "/total – every item and total till today\n"
     "/undo – delete the last entry\n"
-    "/del 3 – delete row #3 of today's table\n"
+    "/del 3 – delete row #3 of the table you last looked at (/del 2 5 deletes several)\n"
     "/clear – empty today's table\n/clear month – empty this month's table"
 )
+
+# Telegram allows 4096 characters per message; longer tables are split into parts
+MAX_MESSAGE_CHARS = 4000
+
+# Which rows each summary shows. `date_chars` is how much of YYYY-MM-DD the Date column shows.
+VIEWS = {
+    "today": {"label": "today's", "date_chars": 0},
+    "month": {"label": "this month's", "date_chars": 5},
+    "all": {"label": "the all-time", "date_chars": 10},
+}
 
 
 def now():
@@ -51,6 +61,10 @@ def db():
                        created_at TEXT NOT NULL
                    )"""
             )
+            # The table each user saw last, so /del numbers match what's on their screen
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS last_view (user_id INTEGER PRIMARY KEY, view TEXT NOT NULL)"
+            )
             yield conn
     finally:
         conn.close()
@@ -69,9 +83,26 @@ def rows_for(user_id, start, end):
     with db() as conn:
         return conn.execute(
             "SELECT id, name, amount, spent_on FROM expenses "
-            "WHERE user_id = ? AND spent_on BETWEEN ? AND ? ORDER BY id",
+            "WHERE user_id = ? AND spent_on BETWEEN ? AND ? ORDER BY spent_on, id",
             (user_id, start, end),
         ).fetchall()
+
+
+def view_rows(user_id, view):
+    today = now().date()
+    start = {"today": today.isoformat(), "month": today.replace(day=1).isoformat(), "all": ""}[view]
+    return rows_for(user_id, start, today.isoformat())
+
+
+def set_last_view(user_id, view):
+    with db() as conn:
+        conn.execute("INSERT OR REPLACE INTO last_view (user_id, view) VALUES (?, ?)", (user_id, view))
+
+
+def get_last_view(user_id):
+    with db() as conn:
+        row = conn.execute("SELECT view FROM last_view WHERE user_id = ?", (user_id,)).fetchone()
+    return row[0] if row else "today"
 
 
 # ---------- formatting ----------
@@ -79,75 +110,59 @@ def fmt_amount(x):
     return f"{x:,.2f}".rstrip("0").rstrip(".")
 
 
-# Telegram allows 4096 characters per message; leave room for text around the table
-MAX_TABLE_CHARS = 3500
+def view_title(view):
+    today = now().date()
+    return {
+        "today": f"Today ({today.isoformat()})",
+        "month": f"This month ({today:%B %Y})",
+        "all": f"All time (till {today.isoformat()})",
+    }[view]
 
 
-def render(title, header, body, footer, right=(0, -1)):
-    """Draw a text table. Columns listed in `right` are right-aligned."""
-    n = len(header)
-    right = {c % n for c in right}
-    widths = [max(len(row[c]) for row in [header, footer, *body]) for c in range(n)]
-
-    def line(row):
-        return " | ".join(row[c].rjust(widths[c]) if c in right else row[c].ljust(widths[c])
-                          for c in range(n))
-
-    sep = "-+-".join("-" * w for w in widths)
-    text = "\n".join([line(header), sep, *map(line, body), sep, line(footer)])
-    return f"<b>{escape(title)}</b>\n<pre>{escape(text)}</pre>", len(title) + len(text)
-
-
-def table(rows, title, show_date=False):
+def table(rows, title, date_chars=0):
+    """Return the table as a list of messages (more than one only when it's too long for Telegram)."""
     if not rows:
-        return f"<b>{escape(title)}</b>\nNo expenses yet."
-    header = ["#", "Date", "Cost", "Amount"] if show_date else ["#", "Cost", "Amount"]
+        return [f"<b>{escape(title)}</b>\nNo expenses yet."]
+    header = ["#", "Date", "Cost", "Amount"] if date_chars else ["#", "Cost", "Amount"]
     body = []
     for i, (_id, name, amount, spent_on) in enumerate(rows, 1):
-        r = [str(i), spent_on[5:], name[:18], fmt_amount(amount)]
-        body.append(r if show_date else [r[0], r[2], r[3]])
+        date = [spent_on[-date_chars:]] if date_chars else []
+        body.append([str(i), *date, name[:18], fmt_amount(amount)])
     total = sum(r[2] for r in rows)
     footer = ([""] * (len(header) - 2)) + ["TOTAL", fmt_amount(total)]
 
-    # Too long for one message: fold the oldest rows into a single "earlier" row.
-    # Row numbers and the total stay correct.
-    hidden = 0
-    while True:
-        shown = body[hidden:]
-        if hidden:
-            earlier = [""] * len(header)
-            earlier[-2] = f"…{hidden} earlier"
-            earlier[-1] = fmt_amount(sum(r[2] for r in rows[:hidden]))
-            shown = [earlier, *shown]
-        html, size = render(title, header, shown, footer)
-        if size <= MAX_TABLE_CHARS or hidden >= len(body) - 1:
-            return html
-        hidden += 1
+    n = len(header)
+    widths = [max(len(row[c]) for row in [header, footer, *body]) for c in range(n)]
+
+    def line(row):
+        return " | ".join(row[c].rjust(widths[c]) if c in (0, n - 1) else row[c].ljust(widths[c])
+                          for c in range(n))
+
+    sep = "-+-".join("-" * w for w in widths)
+    line_len = len(sep) + 1
+    per_part = max(1, (MAX_MESSAGE_CHARS - len(title) - 20 - 4 * line_len) // line_len)
+    parts = [body[i:i + per_part] for i in range(0, len(body), per_part)]
+
+    messages = []
+    for k, part in enumerate(parts, 1):
+        lines = [line(header), sep, *map(line, part)]
+        if k == len(parts):
+            lines += [sep, line(footer)]
+        t = title if len(parts) == 1 else f"{title} ({k}/{len(parts)})"
+        messages.append(f"<b>{escape(t)}</b>\n<pre>{escape(chr(10).join(lines))}</pre>")
+    return messages
 
 
-def today_table(user_id):
-    t = now().date().isoformat()
-    return table(rows_for(user_id, t, t), f"Today ({t})")
-
-
-def month_table(user_id):
-    today = now().date()
-    rows = rows_for(user_id, today.replace(day=1).isoformat(), today.isoformat())
-    return table(rows, f"This month ({today:%B %Y})", show_date=True)
-
-
-def total_table(user_id):
-    with db() as conn:
-        months = conn.execute(
-            "SELECT substr(spent_on, 1, 7) AS ym, SUM(amount), COUNT(*) FROM expenses "
-            "WHERE user_id = ? GROUP BY ym ORDER BY ym",
-            (user_id,),
-        ).fetchall()
-    if not months:
-        return "<b>All time</b>\nNo expenses yet."
-    body = [[datetime.strptime(ym, "%Y-%m").strftime("%b %Y"), str(n), fmt_amount(s)] for ym, s, n in months]
-    footer = ["TOTAL", str(sum(m[2] for m in months)), fmt_amount(sum(m[1] for m in months))]
-    return render("All time", ["Month", "Items", "Amount"], body, footer, right=(1, 2))[0]
+def show(user_id, view, note=None):
+    """Messages showing one summary table, optionally after a note. Remembers it for /del."""
+    set_last_view(user_id, view)
+    messages = table(view_rows(user_id, view), view_title(view), VIEWS[view]["date_chars"])
+    if note:
+        if len(note) + len(messages[0]) < MAX_MESSAGE_CHARS:
+            messages[0] = f"{note}\n\n{messages[0]}"
+        else:
+            messages.insert(0, note)
+    return messages
 
 
 # ---------- message handling ----------
@@ -161,19 +176,25 @@ def undo(user_id):
             "SELECT id, name, amount FROM expenses WHERE user_id = ? ORDER BY id DESC LIMIT 1", (user_id,)
         ).fetchone()
         if not row:
-            return "Nothing to undo."
+            return ["Nothing to undo."]
         conn.execute("DELETE FROM expenses WHERE id = ?", (row[0],))
-    return f"Removed: {escape(row[1])} - {fmt_amount(row[2])}\n\n" + today_table(user_id)
+    return show(user_id, "today", f"Removed: {escape(row[1])} - {fmt_amount(row[2])}")
 
 
-def delete_row(user_id, arg):
-    rows = rows_for(user_id, now().date().isoformat(), now().date().isoformat())
-    if not arg.isdigit() or not 1 <= int(arg) <= len(rows):
-        return "Send the row number from today's table, e.g. <code>/del 2</code>\n\n" + today_table(user_id)
-    row_id, name, amount, _ = rows[int(arg) - 1]
+def delete_rows(user_id, args):
+    view = get_last_view(user_id)
+    rows = view_rows(user_id, view)
+    label = VIEWS[view]["label"]
+    nums = sorted({int(a) for a in args if a.isdigit()})
+    if not nums or len(nums) != len(args) or not all(1 <= x <= len(rows) for x in nums):
+        return [f"Send row numbers from {label} table (it has {len(rows)} rows), "
+                "e.g. <code>/del 2</code> or <code>/del 2 5</code>.\n"
+                "To delete from another table, open it first with /today, /month or /total."]
+    picked = [rows[x - 1] for x in nums]
     with db() as conn:
-        conn.execute("DELETE FROM expenses WHERE id = ?", (row_id,))
-    return f"Removed: {escape(name)} - {fmt_amount(amount)}\n\n" + today_table(user_id)
+        conn.executemany("DELETE FROM expenses WHERE id = ?", [(r[0],) for r in picked])
+    removed = "\n".join(f"#{x} {escape(r[1])} - {fmt_amount(r[2])} ({r[3]})" for x, r in zip(nums, picked))
+    return show(user_id, view, f"🗑 Removed:\n{removed}")
 
 
 def clear(user_id, args):
@@ -183,14 +204,14 @@ def clear(user_id, args):
     label = "this month's" if month else "today's"
     rows = rows_for(user_id, start.isoformat(), today.isoformat())
     if not rows:
-        return f"Nothing to clear, {label} table is already empty."
+        return [f"Nothing to clear, {label} table is already empty."]
     if args[-1:] != ["yes"]:
         cmd = "/clear month yes" if month else "/clear yes"
-        return f"This deletes all {len(rows)} of {label} entries.\nSend <code>{cmd}</code> to confirm."
+        return [f"This deletes all {len(rows)} of {label} entries.\nSend <code>{cmd}</code> to confirm."]
     with db() as conn:
         conn.execute("DELETE FROM expenses WHERE user_id = ? AND spent_on BETWEEN ? AND ?",
                      (user_id, start.isoformat(), today.isoformat()))
-    return f"🗑 Cleared {len(rows)} of {label} entries."
+    return [f"🗑 Cleared {len(rows)} of {label} entries."]
 
 
 def add_lines(user_id, text):
@@ -211,30 +232,29 @@ def add_lines(user_id, text):
     if bad:
         msg.append("⚠️ Couldn't read: " + ", ".join(f"<code>{escape(b)}</code>" for b in bad)
                    + "\nUse the format <code>name - amount</code>")
-    msg.append(today_table(user_id))
-    return "\n\n".join(msg)
+    return show(user_id, "today", "\n\n".join(msg))
 
 
 def handle(user_id, text):
-    """Return the HTML reply for one incoming text message."""
+    """Return the HTML reply for one incoming text message, as a list of messages to send in order."""
     cmd = text.strip().split()[0].split("@")[0].lower() if text.strip().startswith("/") else None
     if cmd in ("/start", "/help"):
-        return f"Hi! Your Telegram user ID is <code>{user_id}</code>.\n\n{HELP}"
+        return [f"Hi! Your Telegram user ID is <code>{user_id}</code>.\n\n{HELP}"]
     if not allowed(user_id):
-        return "Sorry, this bot is private."
+        return ["Sorry, this bot is private."]
     if cmd == "/today":
-        return today_table(user_id)
+        return show(user_id, "today")
     if cmd == "/month":
-        return month_table(user_id)
-    if cmd == "/total":
-        return total_table(user_id)
+        return show(user_id, "month")
+    if cmd in ("/total", "/all"):
+        return show(user_id, "all")
     if cmd == "/undo":
         return undo(user_id)
     args = text.split()[1:]
     if cmd in ("/del", "/delete"):
-        return delete_row(user_id, args[0] if args else "")
+        return delete_rows(user_id, args)
     if cmd == "/clear":
         return clear(user_id, [a.lower() for a in args])
     if cmd:
-        return "Unknown command.\n\n" + HELP
+        return ["Unknown command.\n\n" + HELP]
     return add_lines(user_id, text)
