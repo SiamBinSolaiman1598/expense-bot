@@ -20,14 +20,28 @@ DB_PATH = os.path.join(BASE_DIR, "expenses.db")
 # "name - amount", also accepts "name : amount", "name = amount" or "name 20"
 LINE_RE = re.compile(r"^\s*(.+?)\s*(?:[-:=]\s*|\s)(\d+(?:\.\d+)?)\s*$")
 
+COMMANDS = (
+    "<b>Commands</b>\n\n"
+    "<b>Add</b>\n"
+    "<code>tea - 20</code> – add an expense (send one or many lines at once)\n\n"
+    "<b>See</b>\n"
+    "/today – today's items and total\n"
+    "/month – this month's items and total\n"
+    "/total – every item and total till today\n\n"
+    "<b>Delete</b>\n"
+    "/undo – delete the last entry\n"
+    "/del 3 – delete row #3 of the table you last looked at\n"
+    "/del 2 5 – delete several rows at once\n"
+    "/clear – empty today's table\n"
+    "/clear month – empty this month's table\n\n"
+    "<b>Help</b>\n"
+    "/commands – this list\n"
+    "/help – how to use the bot"
+)
+
 HELP = (
     "Send expenses as:\n<code>tea - 20</code>\n<code>bus fare - 45</code>\n"
-    "(one or many lines per message)\n\n"
-    "Commands:\n/today – today's items\n/month – this month's items and total\n"
-    "/total – every item and total till today\n"
-    "/undo – delete the last entry\n"
-    "/del 3 – delete row #3 of the table you last looked at (/del 2 5 deletes several)\n"
-    "/clear – empty today's table\n/clear month – empty this month's table"
+    "(one or many lines per message)\n\n" + COMMANDS
 )
 
 # Telegram allows 4096 characters per message; longer tables are split into parts
@@ -240,6 +254,8 @@ def handle(user_id, text):
     cmd = text.strip().split()[0].split("@")[0].lower() if text.strip().startswith("/") else None
     if cmd in ("/start", "/help"):
         return [f"Hi! Your Telegram user ID is <code>{user_id}</code>.\n\n{HELP}"]
+    if cmd == "/commands":
+        return [COMMANDS]
     if not allowed(user_id):
         return ["Sorry, this bot is private."]
     if cmd == "/today":
