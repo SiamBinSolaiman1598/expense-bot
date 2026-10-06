@@ -24,6 +24,7 @@ HELP = (
     "Send expenses as:\n<code>tea - 20</code>\n<code>bus fare - 45</code>\n"
     "(one or many lines per message)\n\n"
     "Commands:\n/today – today's summary\n/month – this month's summary\n"
+    "/total – all-time summary by month\n"
     "/undo – delete the last entry\n"
     "/del 3 – delete row #3 of today's table\n"
     "/clear – empty today's table\n/clear month – empty this month's table"
@@ -78,6 +79,25 @@ def fmt_amount(x):
     return f"{x:,.2f}".rstrip("0").rstrip(".")
 
 
+# Telegram allows 4096 characters per message; leave room for text around the table
+MAX_TABLE_CHARS = 3500
+
+
+def render(title, header, body, footer, right=(0, -1)):
+    """Draw a text table. Columns listed in `right` are right-aligned."""
+    n = len(header)
+    right = {c % n for c in right}
+    widths = [max(len(row[c]) for row in [header, footer, *body]) for c in range(n)]
+
+    def line(row):
+        return " | ".join(row[c].rjust(widths[c]) if c in right else row[c].ljust(widths[c])
+                          for c in range(n))
+
+    sep = "-+-".join("-" * w for w in widths)
+    text = "\n".join([line(header), sep, *map(line, body), sep, line(footer)])
+    return f"<b>{escape(title)}</b>\n<pre>{escape(text)}</pre>", len(title) + len(text)
+
+
 def table(rows, title, show_date=False):
     if not rows:
         return f"<b>{escape(title)}</b>\nNo expenses yet."
@@ -89,16 +109,20 @@ def table(rows, title, show_date=False):
     total = sum(r[2] for r in rows)
     footer = ([""] * (len(header) - 2)) + ["TOTAL", fmt_amount(total)]
 
-    widths = [max(len(row[c]) for row in [header, footer, *body]) for c in range(len(header))]
-
-    def line(row):
-        cells = [row[c].rjust(widths[c]) if c in (0, len(row) - 1) else row[c].ljust(widths[c])
-                 for c in range(len(row))]
-        return " | ".join(cells)
-
-    sep = "-+-".join("-" * w for w in widths)
-    text = "\n".join([line(header), sep, *map(line, body), sep, line(footer)])
-    return f"<b>{escape(title)}</b>\n<pre>{escape(text)}</pre>"
+    # Too long for one message: fold the oldest rows into a single "earlier" row.
+    # Row numbers and the total stay correct.
+    hidden = 0
+    while True:
+        shown = body[hidden:]
+        if hidden:
+            earlier = [""] * len(header)
+            earlier[-2] = f"…{hidden} earlier"
+            earlier[-1] = fmt_amount(sum(r[2] for r in rows[:hidden]))
+            shown = [earlier, *shown]
+        html, size = render(title, header, shown, footer)
+        if size <= MAX_TABLE_CHARS or hidden >= len(body) - 1:
+            return html
+        hidden += 1
 
 
 def today_table(user_id):
@@ -110,6 +134,20 @@ def month_table(user_id):
     today = now().date()
     rows = rows_for(user_id, today.replace(day=1).isoformat(), today.isoformat())
     return table(rows, f"This month ({today:%B %Y})", show_date=True)
+
+
+def total_table(user_id):
+    with db() as conn:
+        months = conn.execute(
+            "SELECT substr(spent_on, 1, 7) AS ym, SUM(amount), COUNT(*) FROM expenses "
+            "WHERE user_id = ? GROUP BY ym ORDER BY ym",
+            (user_id,),
+        ).fetchall()
+    if not months:
+        return "<b>All time</b>\nNo expenses yet."
+    body = [[datetime.strptime(ym, "%Y-%m").strftime("%b %Y"), str(n), fmt_amount(s)] for ym, s, n in months]
+    footer = ["TOTAL", str(sum(m[2] for m in months)), fmt_amount(sum(m[1] for m in months))]
+    return render("All time", ["Month", "Items", "Amount"], body, footer, right=(1, 2))[0]
 
 
 # ---------- message handling ----------
@@ -188,6 +226,8 @@ def handle(user_id, text):
         return today_table(user_id)
     if cmd == "/month":
         return month_table(user_id)
+    if cmd == "/total":
+        return total_table(user_id)
     if cmd == "/undo":
         return undo(user_id)
     args = text.split()[1:]
