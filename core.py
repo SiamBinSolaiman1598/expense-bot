@@ -24,7 +24,9 @@ HELP = (
     "Send expenses as:\n<code>tea - 20</code>\n<code>bus fare - 45</code>\n"
     "(one or many lines per message)\n\n"
     "Commands:\n/today – today's summary\n/month – this month's summary\n"
-    "/undo – delete the last entry"
+    "/undo – delete the last entry\n"
+    "/del 3 – delete row #3 of today's table\n"
+    "/clear – empty today's table\n/clear month – empty this month's table"
 )
 
 
@@ -126,6 +128,33 @@ def undo(user_id):
     return f"Removed: {escape(row[1])} - {fmt_amount(row[2])}\n\n" + today_table(user_id)
 
 
+def delete_row(user_id, arg):
+    rows = rows_for(user_id, now().date().isoformat(), now().date().isoformat())
+    if not arg.isdigit() or not 1 <= int(arg) <= len(rows):
+        return "Send the row number from today's table, e.g. <code>/del 2</code>\n\n" + today_table(user_id)
+    row_id, name, amount, _ = rows[int(arg) - 1]
+    with db() as conn:
+        conn.execute("DELETE FROM expenses WHERE id = ?", (row_id,))
+    return f"Removed: {escape(name)} - {fmt_amount(amount)}\n\n" + today_table(user_id)
+
+
+def clear(user_id, args):
+    today = now().date()
+    month = args[:1] == ["month"]
+    start = today.replace(day=1) if month else today
+    label = "this month's" if month else "today's"
+    rows = rows_for(user_id, start.isoformat(), today.isoformat())
+    if not rows:
+        return f"Nothing to clear, {label} table is already empty."
+    if args[-1:] != ["yes"]:
+        cmd = "/clear month yes" if month else "/clear yes"
+        return f"This deletes all {len(rows)} of {label} entries.\nSend <code>{cmd}</code> to confirm."
+    with db() as conn:
+        conn.execute("DELETE FROM expenses WHERE user_id = ? AND spent_on BETWEEN ? AND ?",
+                     (user_id, start.isoformat(), today.isoformat()))
+    return f"🗑 Cleared {len(rows)} of {label} entries."
+
+
 def add_lines(user_id, text):
     added, bad = 0, []
     for raw in text.splitlines():
@@ -161,6 +190,11 @@ def handle(user_id, text):
         return month_table(user_id)
     if cmd == "/undo":
         return undo(user_id)
+    args = text.split()[1:]
+    if cmd in ("/del", "/delete"):
+        return delete_row(user_id, args[0] if args else "")
+    if cmd == "/clear":
+        return clear(user_id, [a.lower() for a in args])
     if cmd:
         return "Unknown command.\n\n" + HELP
     return add_lines(user_id, text)
