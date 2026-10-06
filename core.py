@@ -28,6 +28,10 @@ COMMANDS = (
     "/today – today's items and total\n"
     "/month – this month's items and total\n"
     "/total – every item and total till today\n\n"
+    "<b>Edit</b>\n"
+    "/edit 3 – change row #3 of the table you last looked at (then send e.g. <code>home - 100</code>)\n"
+    "/edit 3 home - 100 – same, in one message\n"
+    "/edit 3 100 – change only the amount\n\n"
     "<b>Delete</b>\n"
     "/undo – delete the last entry\n"
     "/del 3 – delete row #3 of the table you last looked at\n"
@@ -79,6 +83,11 @@ def db():
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS last_view (user_id INTEGER PRIMARY KEY, view TEXT NOT NULL)"
             )
+            # An /edit waiting for the new "name - amount" message
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS pending_edit ("
+                "user_id INTEGER PRIMARY KEY, expense_id INTEGER NOT NULL, created_at TEXT NOT NULL)"
+            )
             yield conn
     finally:
         conn.close()
@@ -117,6 +126,23 @@ def get_last_view(user_id):
     with db() as conn:
         row = conn.execute("SELECT view FROM last_view WHERE user_id = ?", (user_id,)).fetchone()
     return row[0] if row else "today"
+
+
+def set_pending_edit(user_id, expense_id):
+    with db() as conn:
+        conn.execute("INSERT OR REPLACE INTO pending_edit (user_id, expense_id, created_at) VALUES (?, ?, ?)",
+                     (user_id, expense_id, now().isoformat(timespec="seconds")))
+
+
+def pop_pending_edit(user_id):
+    """Return the expense id waiting to be edited (if asked in the last 10 minutes) and forget it."""
+    with db() as conn:
+        row = conn.execute("SELECT expense_id, created_at FROM pending_edit WHERE user_id = ?",
+                           (user_id,)).fetchone()
+        conn.execute("DELETE FROM pending_edit WHERE user_id = ?", (user_id,))
+    if row and (now() - datetime.fromisoformat(row[1])).total_seconds() < 600:
+        return row[0]
+    return None
 
 
 # ---------- formatting ----------
@@ -211,6 +237,45 @@ def delete_rows(user_id, args):
     return show(user_id, view, f"🗑 Removed:\n{removed}")
 
 
+def start_edit(user_id, text):
+    """/edit 3 home - 100 changes row #3 now; /edit 3 alone asks for the new value."""
+    view = get_last_view(user_id)
+    rows = view_rows(user_id, view)
+    m = re.match(r"\s*/\S+\s+(\d+)\s*(.*)$", text, re.S)
+    if not m or not 1 <= int(m.group(1)) <= len(rows):
+        return [f"Send a row number from {VIEWS[view]['label']} table (it has {len(rows)} rows), "
+                "e.g. <code>/edit 2</code> or <code>/edit 2 tea - 40</code>.\n"
+                "To edit another day, open its table first with /month or /total."]
+    num, new = int(m.group(1)), m.group(2).strip()
+    expense_id, name, amount, spent_on = rows[num - 1]
+    if new:
+        return apply_edit(user_id, expense_id, new)
+    set_pending_edit(user_id, expense_id)
+    return [f"✏️ Editing #{num}: {escape(name)} - {fmt_amount(amount)} ({spent_on})\n\n"
+            "Send the new value, e.g. <code>tea - 40</code>\n"
+            "or just a number to change only the amount.\n/cancel to keep it as it is."]
+
+
+def apply_edit(user_id, expense_id, text):
+    with db() as conn:
+        old = conn.execute("SELECT name, amount FROM expenses WHERE id = ? AND user_id = ?",
+                           (expense_id, user_id)).fetchone()
+        if not old:
+            return ["That entry no longer exists."]
+        text = text.strip()
+        if re.fullmatch(r"\d+(?:\.\d+)?", text):
+            name, amount = old[0], float(text)
+        elif m := LINE_RE.match(text):
+            name, amount = m.group(1).strip(), float(m.group(2))
+        else:
+            set_pending_edit(user_id, expense_id)  # keep waiting for a valid value
+            return [f"⚠️ Couldn't read <code>{escape(text)}</code>. Send it like <code>tea - 40</code>, "
+                    "or /cancel."]
+        conn.execute("UPDATE expenses SET name = ?, amount = ? WHERE id = ?", (name, amount, expense_id))
+    return show(user_id, get_last_view(user_id),
+                f"✏️ Edited: {escape(old[0])} - {fmt_amount(old[1])} → {escape(name)} - {fmt_amount(amount)}")
+
+
 def clear(user_id, args):
     today = now().date()
     month = args[:1] == ["month"]
@@ -258,6 +323,14 @@ def handle(user_id, text):
         return [COMMANDS]
     if not allowed(user_id):
         return ["Sorry, this bot is private."]
+    # Any message after "/edit 3" is the new value; a command cancels the edit instead
+    editing = pop_pending_edit(user_id)
+    if editing and not cmd:
+        return apply_edit(user_id, editing, text)
+    if cmd == "/cancel":
+        return ["Edit cancelled." if editing else "Nothing to cancel."]
+    if cmd == "/edit":
+        return start_edit(user_id, text)
     if cmd == "/today":
         return show(user_id, "today")
     if cmd == "/month":
