@@ -3,7 +3,7 @@ import os
 import re
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from html import escape
 from zoneinfo import ZoneInfo
 
@@ -19,13 +19,17 @@ DB_PATH = os.path.join(BASE_DIR, "expenses.db")
 
 # "name - amount", also accepts "name : amount", "name = amount" or "name 20"
 LINE_RE = re.compile(r"^\s*(.+?)\s*(?:[-:=]\s*|\s)(\d+(?:\.\d+)?)\s*$")
+# Optional date before an entry: "10-06-26 tea 20" (month-day-year), "10-06 tea 20" or "2026-10-06 tea 20"
+DATE_RE = re.compile(r"^\s*(\d{1,4})[-/.](\d{1,2})(?:[-/.](\d{2,4}))?\s+(.+)$")
 
 COMMANDS = (
     "<b>Commands</b>\n\n"
     "<b>Add</b>\n"
-    "<code>tea - 20</code> – add an expense (send one or many lines at once)\n\n"
+    "<code>tea - 20</code> – add an expense (send one or many lines at once)\n"
+    "<code>10-06-26 tea - 20</code> – add it on another day (month-day-year; year optional)\n\n"
     "<b>See</b>\n"
     "/month – this month's items and total (shown after every change)\n"
+    "/month 09-26 – another month (month-year)\n"
     "/day – today's items and total\n"
     "/total – every item and total till today\n\n"
     "<b>Edit</b>\n"
@@ -53,12 +57,33 @@ HELP = (
 # Telegram allows 4096 characters per message; longer tables are split into parts
 MAX_MESSAGE_CHARS = 4000
 
-# Which rows each summary shows. `date_chars` is how much of YYYY-MM-DD the Date column shows.
+# Which rows each summary shows: "today", "month" (this month), "month:YYYY-MM" (another month) or "all".
+# `date_chars` is how much of YYYY-MM-DD the Date column shows.
 VIEWS = {
     "today": {"label": "today's", "date_chars": 0},
     "month": {"label": "this month's", "date_chars": 5},
     "all": {"label": "the all-time", "date_chars": 10},
 }
+
+
+def month_view(d):
+    """The view showing the month of date `d`."""
+    t = now()
+    return "month" if (d.year, d.month) == (t.year, t.month) else f"month:{d:%Y-%m}"
+
+
+def view_month(view):
+    """First day of the month a past-month view shows, else None."""
+    return date.fromisoformat(view[6:] + "-01") if view.startswith("month:") else None
+
+
+def view_label(view):
+    m = view_month(view)
+    return f"the {m:%B %Y}" if m else VIEWS[view]["label"]
+
+
+def view_date_chars(view):
+    return VIEWS["month"]["date_chars"] if view_month(view) else VIEWS[view]["date_chars"]
 
 
 def now():
@@ -95,12 +120,12 @@ def db():
         conn.close()
 
 
-def add_expense(user_id, name, amount):
+def add_expense(user_id, name, amount, spent_on=None):
     t = now()
     with db() as conn:
         conn.execute(
             "INSERT INTO expenses (user_id, name, amount, spent_on, created_at) VALUES (?, ?, ?, ?, ?)",
-            (user_id, name, amount, t.date().isoformat(), t.isoformat(timespec="seconds")),
+            (user_id, name, amount, (spent_on or t.date()).isoformat(),t.isoformat(timespec="seconds")),
         )
 
 
@@ -115,6 +140,9 @@ def rows_for(user_id, start, end):
 
 def view_rows(user_id, view):
     today = now().date()
+    if m := view_month(view):
+        end = (m + timedelta(days=31)).replace(day=1) - timedelta(days=1)
+        return rows_for(user_id, m.isoformat(), end.isoformat())
     start = {"today": today.isoformat(), "month": today.replace(day=1).isoformat(), "all": ""}[view]
     return rows_for(user_id, start, today.isoformat())
 
@@ -154,6 +182,8 @@ def fmt_amount(x):
 
 def view_title(view):
     today = now().date()
+    if m := view_month(view):
+        return f"{m:%B %Y}"
     return {
         "today": f"Today ({today.isoformat()})",
         "month": f"This month ({today:%B %Y})",
@@ -198,7 +228,7 @@ def table(rows, title, date_chars=0):
 def show(user_id, view, note=None):
     """Messages showing one summary table, optionally after a note. Remembers it for /del."""
     set_last_view(user_id, view)
-    messages = table(view_rows(user_id, view), view_title(view), VIEWS[view]["date_chars"])
+    messages = table(view_rows(user_id, view), view_title(view), view_date_chars(view))
     if note:
         if len(note) + len(messages[0]) < MAX_MESSAGE_CHARS:
             messages[0] = f"{note}\n\n{messages[0]}"
@@ -226,7 +256,7 @@ def undo(user_id):
 def delete_rows(user_id, args):
     view = get_last_view(user_id)
     rows = view_rows(user_id, view)
-    label = VIEWS[view]["label"]
+    label = view_label(view)
     nums = sorted({int(a) for a in args if a.isdigit()})
     if not nums or len(nums) != len(args) or not all(1 <= x <= len(rows) for x in nums):
         return [f"Send row numbers from {label} table (it has {len(rows)} rows), "
@@ -247,7 +277,7 @@ def start_edit(user_id, text):
     view = get_last_view(user_id)
     rows = view_rows(user_id, view)
     lines = [l for l in text.splitlines() if l.strip()]
-    usage = (f"Send a row number from {VIEWS[view]['label']} table (it has {len(rows)} rows), "
+    usage = (f"Send a row number from {view_label(view)} table (it has {len(rows)} rows), "
              "e.g. <code>/edit 2</code> or <code>/edit 2 tea - 40</code>.\n"
              "To edit another day, open its table first with /month or /total.")
 
@@ -316,25 +346,65 @@ def clear(user_id, args):
     return [f"🗑 Cleared {len(rows)} of {label} entries."]
 
 
+def parse_date(a, b, c):
+    """Date from the parts of "10-06-26" (month-day-year), "10-06" (this year) or "2026-10-06"; None if invalid."""
+    try:
+        if len(a) == 4:
+            return date(int(a), int(b), int(c)) if c else None
+        year = (int(c) + 2000 if len(c) == 2 else int(c)) if c else now().year
+        month, day = int(a), int(b)
+        if month > 12 >= day:  # "25-09-26" can only be day-month-year
+            month, day = day, month
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
 def add_lines(user_id, text):
-    added, bad = 0, []
+    today = now().date()
+    added, dated, bad = 0, [], []
     for raw in text.splitlines():
         if not raw.strip():
             continue
-        m = LINE_RE.match(raw)
+        spent_on, rest = None, raw
+        if d := DATE_RE.match(raw):
+            spent_on = parse_date(*d.groups()[:3])
+            if not spent_on or spent_on > today:
+                bad.append(raw.strip())
+                continue
+            rest = d.group(4)
+        m = LINE_RE.match(rest)
         if m:
-            add_expense(user_id, m.group(1).strip(), float(m.group(2)))
+            add_expense(user_id, m.group(1).strip(), float(m.group(2)), spent_on)
             added += 1
+            if spent_on and spent_on != today:
+                dated.append(spent_on)
         else:
             bad.append(raw.strip())
 
     msg = []
     if added:
         msg.append(f"✅ Added {added} item{'s' if added > 1 else ''}.")
+        if dated:
+            msg[-1] += "\nDated: " + ", ".join(sorted({d.isoformat() for d in dated}))
     if bad:
         msg.append("⚠️ Couldn't read: " + ", ".join(f"<code>{escape(b)}</code>" for b in bad)
-                   + "\nUse the format <code>name - amount</code>")
-    return show(user_id, "month", "\n\n".join(msg))
+                   + "\nUse <code>name - amount</code> or <code>10-06-26 name - amount</code>"
+                   " (month-day-year, not in the future)")
+    # Show the month the entries went into (the latest one, if they span several months)
+    return show(user_id, month_view(max(dated)) if dated else "month", "\n\n".join(msg))
+
+
+def month_command(user_id, args):
+    """/month, /month 9 (this year) or /month 09-26 (month-year)."""
+    if not args:
+        return show(user_id, "month")
+    m = re.fullmatch(r"(\d{1,2})(?:[-/.](\d{2}|\d{4}))?", args[0])
+    if not m or not 1 <= int(m.group(1)) <= 12:
+        return ["Send a month as month-year, e.g. <code>/month 09-26</code> or <code>/month 9</code>."]
+    year = m.group(2)
+    year = (int(year) + 2000 if len(year) == 2 else int(year)) if year else now().year
+    return show(user_id, month_view(date(year, int(m.group(1)), 1)))
 
 
 def handle(user_id, text):
@@ -357,7 +427,7 @@ def handle(user_id, text):
     if cmd in ("/day", "/today"):
         return show(user_id, "today")
     if cmd == "/month":
-        return show(user_id, "month")
+        return month_command(user_id, text.split()[1:])
     if cmd in ("/total", "/all"):
         return show(user_id, "all")
     if cmd == "/undo":
