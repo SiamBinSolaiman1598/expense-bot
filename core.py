@@ -17,8 +17,23 @@ ALLOWED_USER_ID = os.environ.get("ALLOWED_USER_ID", "").strip()
 TZ = ZoneInfo(os.environ.get("TIMEZONE", "UTC").strip() or "UTC")
 DB_PATH = os.path.join(BASE_DIR, "expenses.db")
 
-# "name - amount", also accepts "name : amount", "name = amount" or "name 20"
-LINE_RE = re.compile(r"^\s*(.+?)\s*(?:[-:=]\s*|\s)(\d+(?:\.\d+)?)\s*$")
+# "name - amount", also accepts "name : amount", "name = amount" or "name 20".
+# "name + amount" is money coming back (a returned loan) and is saved as a negative amount.
+LINE_RE = re.compile(r"^\s*(.+?)\s*(?:(\+)\s*|[-:=]\s*|\s)(\d+(?:\.\d+)?)\s*$")
+AMOUNT_RE = re.compile(r"^\s*(\+)?\s*(\d+(?:\.\d+)?)\s*$")
+
+
+def parse_line(text):
+    """(name, amount) from "tea - 20" or "rahim returned + 500" (amount -500), else None."""
+    m = LINE_RE.match(text)
+    return (m.group(1).strip(), -float(m.group(3)) if m.group(2) else float(m.group(3))) if m else None
+
+
+def parse_amount(text):
+    """Amount from "20" or "+500" (-500), else None."""
+    m = AMOUNT_RE.match(text)
+    return (-float(m.group(2)) if m.group(1) else float(m.group(2))) if m else None
+
 # Optional date before an entry: "10-06-26 tea 20" (month-day-year), "10-06 tea 20" or "2026-10-06 tea 20"
 DATE_RE = re.compile(r"^\s*(\d{1,4})[-/.](\d{1,2})(?:[-/.](\d{2,4}))?\s+(.+)$")
 
@@ -26,7 +41,8 @@ COMMANDS = (
     "<b>Commands</b>\n\n"
     "<b>Add</b>\n"
     "<code>tea - 20</code> – add an expense (send one or many lines at once)\n"
-    "<code>10-06-26 tea - 20</code> – add it on another day (month-day-year; year optional)\n\n"
+    "<code>10-06-26 tea - 20</code> – add it on another day (month-day-year; year optional)\n"
+    "<code>rahim returned + 500</code> – money back (e.g. a returned loan), deducted from the total\n\n"
     "<b>See</b>\n"
     "/month – this month's items and total (shown after every change)\n"
     "/month 09-26 – another month (month-year)\n"
@@ -180,6 +196,11 @@ def fmt_amount(x):
     return f"{x:,.2f}".rstrip("0").rstrip(".")
 
 
+def fmt_entry(name, amount):
+    """ "tea - 20", or "rahim returned + 500" for money back, HTML-escaped."""
+    return f"{escape(name)} + {fmt_amount(-amount)}" if amount < 0 else f"{escape(name)} - {fmt_amount(amount)}"
+
+
 def view_title(view):
     today = now().date()
     if m := view_month(view):
@@ -250,7 +271,7 @@ def undo(user_id):
         if not row:
             return ["Nothing to undo."]
         conn.execute("DELETE FROM expenses WHERE id = ?", (row[0],))
-    return show(user_id, "month", f"Removed: {escape(row[1])} - {fmt_amount(row[2])}")
+    return show(user_id, "month", f"Removed: {fmt_entry(row[1], row[2])}")
 
 
 def delete_rows(user_id, args):
@@ -265,7 +286,7 @@ def delete_rows(user_id, args):
     picked = [rows[x - 1] for x in nums]
     with db() as conn:
         conn.executemany("DELETE FROM expenses WHERE id = ?", [(r[0],) for r in picked])
-    removed = "\n".join(f"#{x} {escape(r[1])} - {fmt_amount(r[2])} ({r[3]})" for x, r in zip(nums, picked))
+    removed = "\n".join(f"#{x} {fmt_entry(r[1], r[2])} ({r[3]})" for x, r in zip(nums, picked))
     return show(user_id, view, f"🗑 Removed:\n{removed}")
 
 
@@ -289,7 +310,7 @@ def start_edit(user_id, text):
         if not new:
             expense_id, name, amount, spent_on = rows[num - 1]
             set_pending_edit(user_id, expense_id)
-            return [f"✏️ Editing #{num}: {escape(name)} - {fmt_amount(amount)} ({spent_on})\n\n"
+            return [f"✏️ Editing #{num}: {fmt_entry(name, amount)} ({spent_on})\n\n"
                     "Send the new value, e.g. <code>tea - 40</code>\n"
                     "or just a name or just a number to change only that.\n/cancel to keep it as it is."]
 
@@ -319,14 +340,14 @@ def update_expense(user_id, expense_id, text):
         if not old:
             return "that entry no longer exists"
         text = text.strip()
-        if re.fullmatch(r"\d+(?:\.\d+)?", text):
-            name, amount = old[0], float(text)
-        elif m := LINE_RE.match(text):
-            name, amount = m.group(1).strip(), float(m.group(2))
+        if (amount := parse_amount(text)) is not None:
+            name = old[0]
+        elif parsed := parse_line(text):
+            name, amount = parsed
         else:
             name, amount = text, old[1]
         conn.execute("UPDATE expenses SET name = ?, amount = ? WHERE id = ?", (name, amount, expense_id))
-    return f"{escape(old[0])} - {fmt_amount(old[1])} → {escape(name)} - {fmt_amount(amount)}"
+    return f"{fmt_entry(*old)} → {fmt_entry(name, amount)}"
 
 
 def clear(user_id, args):
@@ -373,9 +394,8 @@ def add_lines(user_id, text):
                 bad.append(raw.strip())
                 continue
             rest = d.group(4)
-        m = LINE_RE.match(rest)
-        if m:
-            add_expense(user_id, m.group(1).strip(), float(m.group(2)), spent_on)
+        if parsed := parse_line(rest):
+            add_expense(user_id, *parsed, spent_on)
             added += 1
             if spent_on and spent_on != today:
                 dated.append(spent_on)
@@ -389,7 +409,8 @@ def add_lines(user_id, text):
             msg[-1] += "\nDated: " + ", ".join(sorted({d.isoformat() for d in dated}))
     if bad:
         msg.append("⚠️ Couldn't read: " + ", ".join(f"<code>{escape(b)}</code>" for b in bad)
-                   + "\nUse <code>name - amount</code> or <code>10-06-26 name - amount</code>"
+                   + "\nUse <code>name - amount</code>, <code>name + amount</code> for money back,"
+                   " or <code>10-06-26 name - amount</code>"
                    " (month-day-year, not in the future)")
     # Show the month the entries went into (the latest one, if they span several months)
     return show(user_id, month_view(max(dated)) if dated else "month", "\n\n".join(msg))
